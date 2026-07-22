@@ -43,9 +43,15 @@ type ClusterSnapshot struct {
 	stateVersionForPreemption uint64
 }
 
+// undoLog records the inverses of speculative snapshot mutations in LIFO order.
+// It backs the ClusterSnapshot's Backup/Restore/Commit session API (see
+// version.go); nothing outside that API should manipulate it directly.
 type undoLog struct {
 	undoOperations []func()
 	stateVersion   uint64
+	// committedVersion is the highest state version whose undo entries were
+	// discarded by commit; versions at or below it are unrestorable.
+	committedVersion uint64
 }
 
 func (ul *undoLog) registerOperation(undoOperation func()) {
@@ -71,6 +77,7 @@ func (ul *undoLog) undo() {
 
 func (ul *undoLog) commit() {
 	ul.undoOperations = nil
+	ul.committedVersion = ul.stateVersion
 }
 
 // New creates a new ClusterSnapshot stub wrapping the provided scheduler snapshot and frameworks.
@@ -93,17 +100,19 @@ func (s *ClusterSnapshot) Transaction(ctx context.Context, transactionFn func() 
 	s.transactionInProgress = true
 	defer func() { s.transactionInProgress = false }()
 
-	initialStateVersion := s.undoLog.stateVersion
+	initialStateVersion := s.Backup()
 	initialStateVersionForPreemption := s.stateVersionForPreemption
 	s.stateVersionForPreemption++
 
 	result, err := transactionFn()
 
 	if err != nil || result == Revert {
-		s.undoLog.restoreState(initialStateVersion)
+		if restoreErr := s.Restore(initialStateVersion); restoreErr != nil {
+			return fmt.Errorf("failed to roll back transaction: %w", restoreErr)
+		}
 		s.stateVersionForPreemption = initialStateVersionForPreemption
 	} else {
-		s.undoLog.commit()
+		s.Commit()
 		// invalidate preemptions done within the transaction
 		s.stateVersionForPreemption++
 	}
@@ -200,17 +209,19 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 		return nil, nil
 	}
 
-	initialStateVersion := s.undoLog.stateVersion
+	initialStateVersion := s.Backup()
 
 	defer func() {
 		if err != nil || opts.DryRun {
-			s.undoLog.restoreState(initialStateVersion)
+			if restoreErr := s.Restore(initialStateVersion); restoreErr != nil && err == nil {
+				err = fmt.Errorf("failed to restore snapshot: %w", restoreErr)
+			}
 		}
-		if initialStateVersion != s.undoLog.stateVersion {
+		if initialStateVersion != s.Backup() {
 			s.stateVersionForPreemption++
 		}
 		if !s.transactionInProgress {
-			s.undoLog.commit()
+			s.Commit()
 		}
 	}()
 
@@ -274,14 +285,16 @@ func (s *ClusterSnapshot) PreemptPods(ctx context.Context, pods []*v1.Pod) (_ *U
 		}
 	}
 
-	initialStateVersion := s.undoLog.stateVersion
+	initialStateVersion := s.Backup()
 
 	defer func() {
 		if err != nil {
-			s.undoLog.restoreState(initialStateVersion)
+			if restoreErr := s.Restore(initialStateVersion); restoreErr != nil {
+				err = fmt.Errorf("%w; additionally failed to restore snapshot: %s", err, restoreErr)
+			}
 		}
 		if !s.transactionInProgress {
-			s.undoLog.commit()
+			s.Commit()
 		}
 	}()
 
@@ -332,7 +345,7 @@ func (s *ClusterSnapshot) Unpreempt(u *Unpreemption) ([]*v1.Pod, error) {
 	u.reverted = true
 
 	if !s.transactionInProgress {
-		s.undoLog.commit()
+		s.Commit()
 	}
 
 	return u.pods, nil
