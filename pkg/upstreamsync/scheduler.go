@@ -450,7 +450,11 @@ func (sched *Scheduler) findNodesThatPassFilters(
 	numAllNodes := len(nodes)
 	numNodesToFind := int32(numAllNodes)
 	if !findAll {
-		numNodesToFind = sched.numNodesToFind
+		// Upstream this is numFeasibleNodesToFind(), which never returns more than the
+		// number of nodes being filtered. sched.numNodesToFind is supplied by the caller,
+		// so it has to be capped here: it sizes the feasibleNodes slice below, and callers
+		// pass math.MaxInt32 to mean "all of them".
+		numNodesToFind = min(sched.numNodesToFind, int32(numAllNodes))
 		if !hasExtenderFilters(schedFramework) && !hasScoring(schedFramework) {
 			numNodesToFind = 1
 		}
