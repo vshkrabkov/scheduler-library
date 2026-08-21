@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/scheduler-library/pkg/upstreamsync"
 
@@ -251,6 +252,9 @@ func (s *ClusterSnapshot) schedulePods(ctx context.Context, pods iter.Seq[*v1.Po
 
 // MakePlacement creates a framework.Placement containing NodeInfo structures for each candidate node name.
 func (s *ClusterSnapshot) MakePlacement(candidateNodeNames []string) (*fwk.Placement, error) {
+	if unique := sets.New(candidateNodeNames...); unique.Len() != len(candidateNodeNames) {
+		return nil, fmt.Errorf("candidate node names contain duplicates: %v", candidateNodeNames)
+	}
 	nodes := make([]fwk.NodeInfo, 0, len(candidateNodeNames))
 	for _, name := range candidateNodeNames {
 		ni, err := s.schedulerSnapshot.NodeInfos().Get(name)
