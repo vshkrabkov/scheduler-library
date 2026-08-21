@@ -11,6 +11,7 @@ require (
 	k8s.io/apimachinery v0.36.0
 	k8s.io/apiserver v0.36.0
 	k8s.io/client-go v0.36.0
+	k8s.io/component-helpers v0.36.0
 	k8s.io/dynamic-resource-allocation v0.36.0
 	k8s.io/klog/v2 v2.140.0
 	k8s.io/kube-scheduler v0.36.0
@@ -307,7 +308,6 @@ require (
 	k8s.io/cloud-provider v0.36.0 // indirect
 	k8s.io/cluster-bootstrap v0.0.0 // indirect
 	k8s.io/component-base v0.36.0 // indirect
-	k8s.io/component-helpers v0.36.0 // indirect
 	k8s.io/controller-manager v0.36.0 // indirect
 	k8s.io/csi-translation-lib v0.0.0 // indirect
 	k8s.io/endpointslice v0.0.0 // indirect
