@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -77,8 +78,8 @@ func TestNewSchedulingSimulatorWithNilInformerFactory(t *testing.T) {
 	if sim == nil {
 		t.Fatal("Expected simulator to be non-nil")
 	}
-	if sim.informerFactory == nil {
-		t.Error("Expected informerFactory to be automatically initialized, got nil")
+	if sim.comps == nil {
+		t.Error("Expected comps to be automatically initialized, got nil")
 	}
 
 	_, err = sim.NewClusterState(t.Context())
@@ -520,5 +521,175 @@ func TestNewClusterSnapshot_PodGroupScheduling(t *testing.T) {
 		if r.SelectedNodeName != "node1" {
 			t.Errorf("Expected pod %s on node1, got %q", r.Pod.Name, r.SelectedNodeName)
 		}
+	}
+}
+
+func TestMultipleSnapshotsAndStates_NoInformerIndexerPanic(t *testing.T) {
+	ctx := t.Context()
+	client := fake.NewClientset()
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	sim, err := NewSchedulingSimulator(ctx, nil, ReadonlyClient{client: fake.NewClientset()}, informerFactory)
+	if err != nil {
+		t.Fatalf("failed to create simulator: %v", err)
+	}
+
+	// Calling NewClusterSnapshot multiple times on the same SchedulingSimulator
+	// must not panic due to informer indexer conflict or already started informers.
+	for i := 0; i < 3; i++ {
+		snap, err := sim.NewClusterSnapshot(ctx, nil, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("iteration %d: NewClusterSnapshot failed: %v", i, err)
+		}
+		if snap == nil {
+			t.Fatalf("iteration %d: Expected snapshot to be non-nil", i)
+		}
+	}
+
+	// Calling NewClusterState multiple times on the same SchedulingSimulator
+	// must also not panic and create isolated states.
+	for i := 0; i < 3; i++ {
+		st, err := sim.NewClusterState(ctx)
+		if err != nil {
+			t.Fatalf("iteration %d: NewClusterState failed: %v", i, err)
+		}
+		if st == nil {
+			t.Fatalf("iteration %d: Expected state to be non-nil", i)
+		}
+	}
+}
+
+func TestDRASnapshotIsolation(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.DynamicResourceAllocation: true,
+	})
+
+	ctx := t.Context()
+	driverName := "test-driver.cdi.k8s.io"
+	className := "dra-test-class"
+	nodeCapacity := map[v1.ResourceName]string{
+		v1.ResourceCPU:    "10",
+		v1.ResourceMemory: "10Gi",
+		v1.ResourcePods:   "110",
+	}
+
+	deviceClass := &resourceapi.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: className,
+		},
+	}
+	node := st.MakeNode().Name("node1").Label("kubernetes.io/hostname", "node1").Capacity(nodeCapacity).Obj()
+
+	// Single device "instance-1" on node1 so only one DRA pod can fit per snapshot.
+	slice := st.MakeResourceSlice("node1", driverName).Device("instance-1").Obj()
+
+	claim1 := st.MakeResourceClaim().
+		Name("claim-1").
+		Namespace("default").
+		UID("uid-claim-1").
+		Request(className).
+		Obj()
+	claim2 := st.MakeResourceClaim().
+		Name("claim-2").
+		Namespace("default").
+		UID("uid-claim-2").
+		Request(className).
+		Obj()
+
+	makePodWithClaim := func(podName, podUID, claimName string) *v1.Pod {
+		resourceClaimName := "my-dra-res"
+
+		pod := st.MakePod().Name(podName).Namespace("default").
+			UID(podUID).
+			PodResourceClaims(v1.PodResourceClaim{Name: resourceClaimName, ResourceClaimName: new(claimName)}).
+			Obj()
+		pod.Spec.Containers = []v1.Container{
+			{
+				Name: "c1",
+				Resources: v1.ResourceRequirements{
+					Claims: []v1.ResourceClaim{{Name: resourceClaimName}},
+				},
+			},
+		}
+		return pod
+	}
+
+	pod1 := makePodWithClaim("pod-1", "uid-pod-1", "claim-1")
+	pod2 := makePodWithClaim("pod-2", "uid-pod-2", "claim-2")
+
+	client := fake.NewClientset(deviceClass, slice, claim1, claim2)
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+
+	// nil cfg applies default kube-scheduler profile (which includes DynamicResources plugin).
+	sim, err := NewSchedulingSimulator(ctx, nil, ReadonlyClient{client: client}, informerFactory)
+	if err != nil {
+		t.Fatalf("NewSchedulingSimulator failed: %v", err)
+	}
+
+	// 1. In snap1, scheduling pod1 reserves the only device ("instance-1") on node1.
+	snap1, err := sim.NewClusterSnapshot(ctx, nil, []*v1.Node{node}, nil, nil)
+	if err != nil {
+		t.Fatalf("snap1 NewClusterSnapshot failed: %v", err)
+	}
+	placement1, err := snap1.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("snap1 MakePlacement failed: %v", err)
+	}
+
+	res1, err := snap1.SchedulePods(ctx, []*v1.Pod{pod1}, placement1, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("snap1 SchedulePods(pod1) failed: %v", err)
+	}
+	if len(res1) != 1 || !res1[0].Status.IsSuccess() {
+		t.Fatalf("snap1 expected pod1 to schedule successfully, got: %+v", res1)
+	}
+
+	// Within the same snapshot (snap1), pod2 must fail because "instance-1" is already reserved by claim1.
+	res1Pod2, err := snap1.SchedulePods(ctx, []*v1.Pod{pod2}, placement1, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("snap1 SchedulePods(pod2) failed: %v", err)
+	}
+	if len(res1Pod2) != 1 || res1Pod2[0].Status.IsSuccess() {
+		t.Fatalf("snap1 expected pod2 to fail scheduling due to exhausted DRA device, but succeeded: %+v", res1Pod2)
+	}
+
+	// 2. In snap2 (created from the same simulator), DRA state must be isolated from snap1:
+	// pod2 (using claim2) must schedule successfully on node1.
+	snap2, err := sim.NewClusterSnapshot(ctx, nil, []*v1.Node{node}, nil, nil)
+	if err != nil {
+		t.Fatalf("snap2 NewClusterSnapshot failed: %v", err)
+	}
+	placement2, err := snap2.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("snap2 MakePlacement failed: %v", err)
+	}
+
+	res2, err := snap2.SchedulePods(ctx, []*v1.Pod{pod2}, placement2, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("snap2 SchedulePods(pod2) failed: %v", err)
+	}
+	if len(res2) != 1 || !res2[0].Status.IsSuccess() {
+		t.Fatalf("snap2 expected pod2 to schedule successfully (isolated from snap1 DRA allocation), got: %+v", res2)
+	}
+
+	// 3. In ClusterState created from the same simulator, scheduling pod1 must also succeed.
+	state, err := sim.NewClusterState(ctx)
+	if err != nil {
+		t.Fatalf("NewClusterState failed: %v", err)
+	}
+	state.Cache.AddNode(klog.FromContext(ctx), node)
+	if err := state.SyncSnapshot(klog.FromContext(ctx)); err != nil {
+		t.Fatalf("SyncSnapshot failed: %v", err)
+	}
+	stateSnap := state.GetAssociatedSnapshot()
+	statePlacement, err := stateSnap.MakePlacement([]string{"node1"})
+	if err != nil {
+		t.Fatalf("stateSnap MakePlacement failed: %v", err)
+	}
+	resState, err := stateSnap.SchedulePods(ctx, []*v1.Pod{pod1}, statePlacement, snapshot.SchedulePodsOptions{})
+	if err != nil {
+		t.Fatalf("stateSnap SchedulePods(pod1) failed: %v", err)
+	}
+	if len(resState) != 1 || !resState[0].Status.IsSuccess() {
+		t.Fatalf("stateSnap expected pod1 to schedule successfully, got: %+v", resState)
 	}
 }
